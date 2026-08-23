@@ -1,11 +1,14 @@
 from std.math import abs, floor, log, sqrt
 from std.memory import UnsafePointer
-from std.sys import simd_width_of
+from std.bit import count_trailing_zeros
+from std.sys import simd_width_of as simdwidthof
 
 
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime UPtr = UnsafePointer[UInt32, AnyOrigin[mut=True]]
+comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
+comptime U64Ptr = UnsafePointer[UInt64, AnyOrigin[mut=True]]
 comptime LN2 = 0.693147180559945309417232121458
 comptime REG_EPS = 1.0e-9
 
@@ -214,6 +217,19 @@ def sample_entropy(
     x: FPtr, n: Int, order: Int, tolerance: Float64, metric: Int
 ) -> Float64:
     var vectors = n - order
+    if order == 2:
+        var inclusive = not (metric == 0 and n < 5000)
+        var counts = sample_entropy_order2_range(
+            x, vectors, tolerance, metric, inclusive, 0, 1
+        )
+        var denominator = counts[0]
+        var numerator = counts[1]
+        if denominator == 0:
+            return nan_value()
+        if numerator == 0:
+            return infinity()
+        return -log(Float64(numerator) / Float64(denominator))
+
     var denominator = Int64(0)
     var numerator = Int64(0)
     var inclusive = not (metric == 0 and n < 5000)
@@ -230,6 +246,91 @@ def sample_entropy(
     if numerator == 0:
         return infinity()
     return -log(Float64(numerator) / Float64(denominator))
+
+
+def sample_entropy_order2_range(
+    x: FPtr,
+    vectors: Int,
+    tolerance: Float64,
+    metric: Int,
+    inclusive: Bool,
+    first_i: Int,
+    i_stride: Int,
+) -> Tuple[Int64, Int64]:
+    comptime W = simdwidthof[DType.float64]()
+    var denominator = Int64(0)
+    var numerator = Int64(0)
+    var ones = SIMD[DType.int64, W](1)
+    var zeros = SIMD[DType.int64, W](0)
+    var radius2 = tolerance * tolerance
+    var i = first_i
+    while i < vectors:
+        var xi0 = SIMD[DType.float64, W](x[i])
+        var xi1 = SIMD[DType.float64, W](x[i + 1])
+        var xi2 = SIMD[DType.float64, W](x[i + 2])
+        var j = i + 1
+        while j + W <= vectors:
+            var d0 = abs(x.load[width=W](j) - xi0)
+            var d1 = abs(x.load[width=W](j + 1) - xi1)
+            var base = (
+                max(d0, d1).le(tolerance)
+                if inclusive
+                else max(d0, d1).lt(tolerance)
+            )
+            if metric != 0:
+                base = (
+                    (d0 * d0 + d1 * d1).le(radius2)
+                    if inclusive
+                    else (d0 * d0 + d1 * d1).lt(radius2)
+                )
+            var d2 = abs(x.load[width=W](j + 2) - xi2)
+            var extended = base & (
+                max(max(d0, d1), d2).le(tolerance)
+                if inclusive
+                else max(max(d0, d1), d2).lt(tolerance)
+            )
+            if metric != 0:
+                extended = base & (
+                    (d0 * d0 + d1 * d1 + d2 * d2).le(radius2)
+                    if inclusive
+                    else (d0 * d0 + d1 * d1 + d2 * d2).lt(radius2)
+                )
+            denominator += base.select(ones, zeros).reduce_add()
+            numerator += extended.select(ones, zeros).reduce_add()
+            j += W
+        while j < vectors:
+            var d0 = abs(x[j] - x[i])
+            var d1 = abs(x[j + 1] - x[i + 1])
+            var base_match = (
+                max(d0, d1) <= tolerance
+                if inclusive
+                else max(d0, d1) < tolerance
+            )
+            if metric != 0:
+                base_match = (
+                    d0 * d0 + d1 * d1 <= radius2
+                    if inclusive
+                    else d0 * d0 + d1 * d1 < radius2
+                )
+            if base_match:
+                denominator += 1
+                var d2 = abs(x[j + 2] - x[i + 2])
+                var extended_match = (
+                    max(max(d0, d1), d2) <= tolerance
+                    if inclusive
+                    else max(max(d0, d1), d2) < tolerance
+                )
+                if metric != 0:
+                    extended_match = (
+                        d0 * d0 + d1 * d1 + d2 * d2 <= radius2
+                        if inclusive
+                        else d0 * d0 + d1 * d1 + d2 * d2 < radius2
+                    )
+                if extended_match:
+                    numerator += 1
+            j += 1
+        i += i_stride
+    return (denominator, numerator)
 
 
 def lz_complexity(sequence: UPtr, n: Int) -> Int:
@@ -256,6 +357,54 @@ def lz_complexity(sequence: UPtr, n: Int) -> Int:
                 max_substring_len = 1
             substring_len = 1
     if substring_len != 1:
+        complexity += 1
+    return complexity
+
+
+def packed_word(sequence: BPtr, bit: Int) -> UInt64:
+    var byte = bit // 8
+    var shift = bit % 8
+    var words = (sequence + byte).bitcast[UInt64]()
+    var low = words.load[alignment=1]()
+    if shift == 0:
+        return low
+    var high = (sequence + byte + 8).bitcast[UInt64]().load[alignment=1]()
+    return (low >> UInt64(shift)) | (high << UInt64(64 - shift))
+
+
+def lz_complexity_packed_binary(
+    sequence: BPtr, windows: U64Ptr, n: Int
+) -> Int:
+    if n == 0:
+        return 1
+    for bit in range(n):
+        windows[bit] = packed_word(sequence, bit)
+    var complexity = 1
+    var prefix_len = 1
+    while prefix_len < n:
+        var remaining = n - prefix_len
+        var phrase_len = 1
+        for pointer in range(prefix_len):
+            var matched = 0
+            while matched < remaining:
+                var different = (
+                    windows[pointer + matched]
+                    ^ windows[prefix_len + matched]
+                )
+                var available = remaining - matched
+                if different == 0:
+                    matched += min(64, available)
+                    if available <= 64:
+                        break
+                else:
+                    matched += min(
+                        Int(count_trailing_zeros(different)), available
+                    )
+                    break
+            phrase_len = max(phrase_len, min(matched + 1, remaining))
+            if phrase_len == remaining:
+                break
+        prefix_len += phrase_len
         complexity += 1
     return complexity
 
@@ -357,7 +506,7 @@ def linear_slope_from_sums(
 
 
 def higuchi(x: FPtr, n: Int, kmax: Int) -> Float64:
-    comptime W = simd_width_of[DType.float64]()
+    comptime W = simdwidthof[DType.float64]()
     var sx = Float64(0)
     var sx2 = Float64(0)
     var sy = Float64(0)
@@ -561,6 +710,35 @@ def ma_sample_entropy(
     return sample_entropy(fp(x_addr), n, order, tolerance, metric)
 
 
+@export("ma_sample_entropy_order2_counts")
+def ma_sample_entropy_order2_counts(
+    x_addr: Int,
+    counts_addr: Int,
+    n: Int,
+    tolerance: Float64,
+    metric: Int,
+    first_i: Int,
+    i_stride: Int,
+) abi("C"):
+    if (
+        x_addr == 0 or counts_addr == 0 or n <= 2
+        or first_i < 0 or i_stride < 1
+    ):
+        return
+    var counts = sample_entropy_order2_range(
+        fp(x_addr),
+        n - 2,
+        tolerance,
+        metric,
+        not (metric == 0 and n < 5000),
+        first_i,
+        i_stride,
+    )
+    var result = ip(counts_addr)
+    result[0] = counts[0]
+    result[1] = counts[1]
+
+
 @export("ma_lziv_complexity")
 def ma_lziv_complexity(sequence_addr: Int, n: Int) abi("C") -> Int:
     if n == 0:
@@ -568,6 +746,21 @@ def ma_lziv_complexity(sequence_addr: Int, n: Int) abi("C") -> Int:
     if sequence_addr == 0 or n < 0:
         return 0
     return lz_complexity(up(sequence_addr), n)
+
+
+@export("ma_lziv_complexity_packed_binary")
+def ma_lziv_complexity_packed_binary(
+    sequence_addr: Int, windows_addr: Int, n: Int
+) abi("C") -> Int:
+    if n == 0:
+        return 1
+    if sequence_addr == 0 or windows_addr == 0 or n < 0:
+        return 0
+    return lz_complexity_packed_binary(
+        BPtr(unsafe_from_address=sequence_addr),
+        U64Ptr(unsafe_from_address=windows_addr),
+        n,
+    )
 
 
 @export("ma_num_zerocross")

@@ -90,6 +90,22 @@ def test_sample_entropy_kdtree_size_branch():
     )
 
 
+@pytest.mark.parametrize("metric", ["chebyshev", "euclidean"])
+def test_sample_entropy_order2_simd_tail(metric):
+    x = np.random.default_rng(199).normal(size=713)
+    assert mant.sample_entropy(x, metric=metric) == pytest.approx(
+        ant.sample_entropy(x, metric=metric), abs=5e-9
+    )
+
+
+@pytest.mark.parametrize("size", [2999, 3001])
+def test_sample_entropy_parallel_threshold(size):
+    x = np.random.default_rng(size).normal(size=size)
+    assert mant.sample_entropy(x) == pytest.approx(
+        ant.sample_entropy(x), abs=5e-9
+    )
+
+
 @pytest.mark.parametrize(
     "sequence",
     [
@@ -106,6 +122,19 @@ def test_lziv_complexity_parity(sequence):
     assert mant.lziv_complexity(sequence, normalize=True) == pytest.approx(
         ant.lziv_complexity(sequence, normalize=True), abs=1e-12
     )
+
+
+@pytest.mark.parametrize("size", [1024, 1031, 4097])
+def test_lziv_complexity_packed_binary_path(size):
+    sequence = np.random.default_rng(size).integers(
+        0, 2, size=size, dtype=np.uint32
+    )
+    assert mant.lziv_complexity(sequence) == ant.lziv_complexity(sequence)
+
+
+def test_lziv_complexity_packed_binary_overlapping_match():
+    sequence = np.zeros(2049, dtype=np.uint32)
+    assert mant.lziv_complexity(sequence) == ant.lziv_complexity(sequence)
 
 
 @pytest.mark.parametrize("normalize", [False, True])
@@ -271,7 +300,9 @@ def test_exported_abi_rejects_null_buffers():
     native.ma_perm_entropy_order3(0, 0, 0, 0, 0, 0)
     assert np.isnan(native.ma_app_entropy(0, 0, 0, 0.0, 0))
     assert np.isnan(native.ma_sample_entropy(0, 0, 0, 0.0, 0))
+    native.ma_sample_entropy_order2_counts(0, 0, 0, 0.0, 0, 0, 0)
     assert native.ma_lziv_complexity(0, 0) == 1
+    assert native.ma_lziv_complexity_packed_binary(0, 0, 0) == 1
     native.ma_num_zerocross(0, 0, 0, 0)
     native.ma_hjorth_params(0, 0, 0, 0, 0, 1.0)
     native.ma_petrosian_fd(0, 0, 0, 0)

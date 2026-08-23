@@ -64,35 +64,42 @@ the library is absent. Development checks are `pixi run test` and
 The test suite compares every covered function against the real `antropy`
 0.2.2 package on random, periodic, monotonic, tied, multidimensional, and
 explicit-tolerance inputs. It also exercises both upstream sample-entropy
-branches around the 5,000-sample Numba/KD-tree cutoff and the Higuchi SIMD
-remainder path. Run the 71 parity, validation, and behavior tests with
+branches around the 5,000-sample Numba/KD-tree cutoff, the sample-entropy
+parallel cutoff and SIMD remainder, the packed-binary LZ path, and the Higuchi
+SIMD remainder path. Run the 79 parity, validation, and behavior tests with
 `pixi run test`.
 
 ## Benchmarks
 
 Measured with `pixi run bench` on an Intel Xeon E5-2697 v4 at 2.30 GHz
 (Linux x86-64). Each implementation is warmed first and the table reports the
-best of three runs on identical contiguous float64 data.
+best of three runs on identical contiguous inputs.
 
 | measure | mojo-antropy | antropy 0.2.2 | result |
 | --- | ---: | ---: | ---: |
-| `perm_entropy` order=3 (1M) | 5.86 ms | 50.27 ms | 8.57x faster |
-| `sample_entropy` order=2 (4k) | 33.78 ms | 45.92 ms | 1.36x faster |
-| `lziv_complexity` binary (50k) | 964.16 ms | 1080.33 ms | 1.12x faster |
-| `num_zerocross` (1000x10k) | 21.11 ms | 47.24 ms | 2.24x faster |
-| `hjorth_params` (1000x10k) | 87.55 ms | 367.60 ms | 4.20x faster |
-| `petrosian_fd` (1000x10k) | 13.49 ms | 88.66 ms | 6.57x faster |
-| `katz_fd` (1000x10k) | 22.91 ms | 254.83 ms | 11.12x faster |
-| `higuchi_fd` kmax=10 (500k) | 3.77 ms | 7.37 ms | 1.96x faster |
-| `detrended_fluctuation` (500k) | 101.86 ms | 453.99 ms | 4.46x faster |
+| `perm_entropy` order=3 (1M) | 5.94 ms | 56.74 ms | 9.55x faster |
+| `sample_entropy` order=2 (4k) | 4.12 ms | 36.31 ms | 8.82x faster |
+| `lziv_complexity` binary (50k) | 192.24 ms | 776.77 ms | 4.04x faster |
+| `num_zerocross` (1000x10k) | 10.96 ms | 32.99 ms | 3.01x faster |
+| `hjorth_params` (1000x10k) | 88.45 ms | 2969.70 ms | 33.58x faster |
+| `petrosian_fd` (1000x10k) | 13.55 ms | 744.28 ms | 54.92x faster |
+| `katz_fd` (1000x10k) | 23.43 ms | 2096.35 ms | 89.48x faster |
+| `higuchi_fd` kmax=10 (500k) | 3.67 ms | 8.11 ms | 2.21x faster |
+| `detrended_fluctuation` (500k) | 91.13 ms | 329.81 ms | 3.62x faster |
 
-The order-3 permutation path uses six fixed counters instead of allocating,
-clearing, and scanning a hash table sized from the number of windows. Higuchi
-FD traverses each lag as contiguous float64 SIMD loads, then handles the
-remainder with a scalar tail. LZ parsing remains a serial, data-dependent
-kernel.
+The order-2 sample-entropy path compares candidate templates in float64 SIMD
+lanes, reduces match masks into counters, and handles the remainder with a
+scalar tail. Signals of at least 3,000 samples are split into eight independent
+native ranges; smaller signals remain serial to avoid thread-launch overhead.
+Binary LZ inputs of at least 1,024 symbols are bit-packed and compared through
+precomputed rolling 64-bit windows, while other alphabets use the general
+serial parser. The order-3 permutation and Higuchi paths retain their existing
+fixed-counter and SIMD implementations.
 
-No GPU or CPU-parallel path is provided in this shared-library build.
+No GPU path is provided. Sample matching performs fewer than roughly two
+arithmetic operations per byte loaded, and LZ parsing is branch-heavy and
+data-dependent, so neither target has enough arithmetic intensity to repay
+device transfer and launch costs.
 
 ## How it works
 

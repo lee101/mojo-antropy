@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from math import factorial, log
 
 import numpy as np
@@ -125,11 +126,50 @@ def app_entropy(x, order=2, tolerance=None, metric="chebyshev"):
     )
 
 
+_SAMPLE_PARALLEL_THRESHOLD = 3000
+_SAMPLE_PARALLEL_TASKS = 8
+_sample_executor = None
+
+
+def _parallel_sample_entropy_order2(array, radius, metric):
+    global _sample_executor
+    if _sample_executor is None:
+        _sample_executor = ThreadPoolExecutor(
+            max_workers=_SAMPLE_PARALLEL_TASKS,
+            thread_name_prefix="mojo-antropy",
+        )
+    counts = np.empty((_SAMPLE_PARALLEL_TASKS, 2), dtype=np.int64)
+    native = lib().ma_sample_entropy_order2_counts
+    array_addr = addr(array)
+    futures = [
+        _sample_executor.submit(
+            native,
+            array_addr,
+            addr(counts[task]),
+            array.size,
+            radius,
+            metric,
+            task,
+            _SAMPLE_PARALLEL_TASKS,
+        )
+        for task in range(_SAMPLE_PARALLEL_TASKS)
+    ]
+    for future in futures:
+        future.result()
+    denominator, numerator = counts.sum(axis=0)
+    if denominator == 0:
+        return float("nan")
+    if numerator == 0:
+        return float("inf")
+    return -log(numerator / denominator)
+
+
 def sample_entropy(x, order=2, tolerance=None, metric="chebyshev"):
     array, order, radius = _entropy_input(x, order, tolerance)
-    return lib().ma_sample_entropy(
-        addr(array), array.size, order, radius, _metric_code(metric)
-    )
+    metric_code = _metric_code(metric)
+    if order == 2 and array.size >= _SAMPLE_PARALLEL_THRESHOLD:
+        return _parallel_sample_entropy_order2(array, radius, metric_code)
+    return lib().ma_sample_entropy(addr(array), array.size, order, radius, metric_code)
 
 
 def _sequence_u32(sequence) -> np.ndarray:
@@ -170,7 +210,16 @@ def lziv_complexity(sequence, normalize=False):
         if normalize:
             raise ValueError("cannot normalize an empty sequence.")
         return 1
-    complexity = lib().ma_lziv_complexity(addr(encoded), encoded.size)
+    if encoded.size >= 1024 and np.all(encoded <= 1):
+        packed_size = (encoded.size + 7) // 8
+        packed = np.zeros(packed_size + 16, dtype=np.uint8)
+        packed[:packed_size] = np.packbits(encoded, bitorder="little")
+        windows = np.empty(encoded.size, dtype=np.uint64)
+        complexity = lib().ma_lziv_complexity_packed_binary(
+            addr(packed), addr(windows), encoded.size
+        )
+    else:
+        complexity = lib().ma_lziv_complexity(addr(encoded), encoded.size)
     if not normalize:
         return complexity
     n = encoded.size
