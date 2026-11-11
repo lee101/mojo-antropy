@@ -298,14 +298,14 @@ def test_exported_abi_rejects_null_buffers():
     native = lib()
     native.ma_perm_entropy(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     native.ma_perm_entropy_order3(0, 0, 0, 0, 0, 0)
-    assert np.isnan(native.ma_app_entropy(0, 0, 0, 0.0, 0))
+    assert np.isnan(native.ma_app_entropy(0, 0, 0, 0, 0.0, 0, 0))
     assert np.isnan(native.ma_sample_entropy(0, 0, 0, 0.0, 0))
     native.ma_sample_entropy_order2_counts(0, 0, 0, 0.0, 0, 0, 0)
     assert native.ma_lziv_complexity(0, 0) == 1
     assert native.ma_lziv_complexity_packed_binary(0, 0, 0) == 1
     native.ma_num_zerocross(0, 0, 0, 0)
-    native.ma_hjorth_params(0, 0, 0, 0, 0, 1.0)
+    native.ma_hjorth_params(0, 0, 0, 0, 0, 1.0, 0)
     native.ma_petrosian_fd(0, 0, 0, 0)
     native.ma_katz_fd(0, 0, 0, 0)
     assert np.isnan(native.ma_higuchi_fd(0, 0, 0))
-    assert np.isnan(native.ma_detrended_fluctuation(0, 0, 0))
+    assert np.isnan(native.ma_detrended_fluctuation(0, 0, 0, 0))

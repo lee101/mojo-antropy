@@ -1,3 +1,4 @@
+from ._lib import parallel_workers
 from .core import (
     app_entropy,
     detrended_fluctuation,
@@ -23,4 +24,5 @@ __all__ = [
     "katz_fd",
     "higuchi_fd",
     "detrended_fluctuation",
+    "parallel_workers",
 ]

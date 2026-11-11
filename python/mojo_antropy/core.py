@@ -5,7 +5,7 @@ from math import factorial, log
 
 import numpy as np
 
-from ._lib import addr, f64, lib
+from ._lib import addr, f64, lib, parallel_capacity, workers
 
 
 def _integral(value, name: str) -> int:
@@ -73,9 +73,12 @@ def perm_entropy(x, order=3, delay=1, normalize=False):
     capacity = 1
     while capacity < 2 * windows:
         capacity *= 2
-    keys = np.empty(capacity, dtype=np.int64)
-    counts = np.empty(capacity, dtype=np.int64)
-    work = np.empty(order, dtype=np.int64)
+    # Rows run independently, in parallel once the batch is large enough, so
+    # each row gets its own hash table and ordinal-rank scratch instead of
+    # sharing one. The tables are cleared per row inside the kernel.
+    keys = np.empty(capacity * rows.shape[0], dtype=np.int64)
+    counts = np.empty(capacity * rows.shape[0], dtype=np.int64)
+    work = np.empty(order * rows.shape[0], dtype=np.int64)
     lib().ma_perm_entropy(
         addr(rows),
         addr(result),
@@ -121,8 +124,17 @@ def _entropy_input(x, order, tolerance):
 
 def app_entropy(x, order=2, tolerance=None, metric="chebyshev"):
     array, order, radius = _entropy_input(x, order, tolerance)
+    # The parallel path records one exact match count per row and reduces them
+    # serially, so it needs one int64 per row; serial calls ignore it.
+    counts = np.empty(parallel_capacity(array.size), dtype=np.int64)
     return lib().ma_app_entropy(
-        addr(array), array.size, order, radius, _metric_code(metric)
+        addr(array),
+        addr(counts),
+        array.size,
+        order,
+        radius,
+        _metric_code(metric),
+        workers(),
     )
 
 
@@ -261,6 +273,7 @@ def hjorth_params(x, sf=None, axis=-1):
         rows.shape[0],
         rows.shape[1],
         1.0 if sf is None else float(sf),
+        workers(),
     )
     return _finish(mobility, shape), _finish(complexity, shape)
 
@@ -304,4 +317,6 @@ def detrended_fluctuation(x):
     if array.size == 0:
         raise ValueError("x must contain at least one sample.")
     walk = np.empty_like(array)
-    return lib().ma_detrended_fluctuation(addr(array), addr(walk), array.size)
+    return lib().ma_detrended_fluctuation(
+        addr(array), addr(walk), array.size, workers()
+    )

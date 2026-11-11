@@ -2,6 +2,8 @@ from std.math import abs, floor, log, sqrt
 from std.memory import UnsafePointer
 from std.bit import count_trailing_zeros
 from std.sys import simd_width_of as simdwidthof
+from std.collections import List
+from max.algorithm import parallelize
 
 
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
@@ -12,6 +14,34 @@ comptime U64Ptr = UnsafePointer[UInt64, AnyOrigin[mut=True]]
 comptime LN2 = 0.693147180559945309417232121458
 comptime REG_EPS = 1.0e-9
 
+# The worker cap is a host rule: this machine is shared, so four workers is the
+# ceiling unless a benchmark shows more helps.
+comptime WORKER_CAP = 4
+
+# Crossovers measured on a 72-CPU Xeon E5-2697 v4 with bench/parallel.py and
+# spot-checked in repeated runs, then given a margin above the break-even point.
+# Only kernels where the benchmark showed a repeatable win are parallel; the
+# rest keep the serial loop and say so at the call site.
+#
+# Hjorth: three passes of arithmetic per row over 10k samples. Four workers were
+# 2.2x faster at 256 rows and 3.0x at 1000; break-even is below 128 rows, and
+# 256 leaves the margin. Below it the serial pass costs well under a
+# millisecond.
+comptime HJORTH_ROWS_PARALLEL_MIN = 256
+# num_zerocross / petrosian_fd / katz_fd are ~0.1-0.25 flops per byte: the row
+# loop is already limited by memory bandwidth, and four workers measured 15-35%
+# SLOWER at 512-1000 rows on this host. They stay serial.
+#
+# AppEnumerate: the O(n^2) match loop needs its outer index split across workers
+# to move the needle. Serial and four workers tie at 1000 samples (7.2 vs
+# 7.5 ms), four workers win 1.1x at 1500, 1.7x at 2000, 3.2x at 4000 and 3.1x
+# at 8000. 2000 is the measured break-even, and the threshold sits there rather
+# than above it because the win grows steeply with n and callers rarely pass
+# smaller signals to an O(n^2) estimator.
+comptime APP_ENTROPY_PARALLEL_MIN = 2000
+# DFA: break-even is ~40k samples; below it the run is a handful of
+# milliseconds and fan-out costs more than it saves. 64k is the margin.
+comptime DFA_PARALLEL_MIN = 64_000
 
 def fp(addr: Int) -> FPtr:
     return FPtr(unsafe_from_address=addr)
@@ -190,6 +220,100 @@ def vectors_match(
     return squared <= radius2 if inclusive else squared < radius2
 
 
+def worker_count(slot: U64Ptr) -> Int:
+    # The Python wrapper owns the knob: a one-element UInt64 whose address is
+    # handed over by ma_parallel_workers. Mojo rejects mutable globals, so this
+    # is how the caller pins the worker count (1 = serial) without any state
+    # living in the shared library.
+    return max(1, min(Int(slot.unsafe_load(0)), WORKER_CAP))
+
+
+def workers_param(slot_addr: Int) -> Int:
+    if slot_addr == 0:
+        return 1
+    return worker_count(U64Ptr(unsafe_from_address=slot_addr))
+
+
+# Row batches turn the batch into an explicit list of (row start, row stop)
+# ranges and apply one range function to each range. A worker builds its range
+# list once; the lists partition [0, rows). Every row is independent, so the
+# parallel path differs from the serial one only in which thread owns a row: no
+# row is ever split, each row computes the identical floating-point expression,
+# and the two paths are bit-identical rather than merely within tolerance.
+def split_ranges(count: Int, ranges: Int) -> List[List[Int]]:
+    var pieces = ranges if count > 0 else 0
+    var result = List[List[Int]]()
+    result.reserve(pieces)
+    if pieces == 0:
+        return result^
+    var base = count // pieces
+    var extra = count % pieces
+    var start = 0
+    for piece in range(pieces):
+        var stop = start + base + (1 if piece < extra else 0)
+        var bounds = List[Int]()
+        bounds.append(start)
+        bounds.append(stop)
+        result.append(bounds^)
+        start = stop
+    return result^
+
+
+def empty_partials(count: Int) -> FPtr:
+    return FPtr(unsafe_from_address=Int(alloc[Float64](count=count)))
+
+
+# AppEnumerate is a double loop over template starts. Splitting the outer index
+# across workers and summing integer match counts is exact: the integer totals
+# do not depend on summation order. The entropy sum then runs serially over the
+# rows in the same order as the serial version, so the logs accumulate in the
+# same order and the two paths agree bit-for-bit.
+def approximate_phi_parallel(
+    x: FPtr,
+    n: Int,
+    order: Int,
+    tolerance: Float64,
+    metric: Int,
+    counts: IPtr,
+    workers: Int,
+) -> Float64:
+    var vectors = n - order + 1
+    def work(start: Int) {imm}:
+        var i = start
+        while i < vectors:
+            var matches = Int64(0)
+            for j in range(vectors):
+                if vectors_match(x, i, j, order, tolerance, metric, True):
+                    matches += 1
+            counts.unsafe_store(i, matches)
+            i += workers
+    parallelize(work, workers, workers)
+    # Serial reduction in row order: identical floating-point operations to
+    # approximate_phi, whose per-row logs are summed here in the same order.
+    var total = Float64(0)
+    for i in range(vectors):
+        total += log(Float64(counts.unsafe_load(i)) / Float64(vectors))
+    return total / Float64(vectors)
+
+
+def approximate_entropy_parallel(
+    x: FPtr,
+    n: Int,
+    order: Int,
+    tolerance: Float64,
+    metric: Int,
+    counts: IPtr,
+    workers: Int,
+) -> Float64:
+    var phi_short = approximate_phi_parallel(
+        x, n, order, tolerance, metric, counts, workers
+    )
+    var phi_long = approximate_phi_parallel(
+        x, n, order + 1, tolerance, metric, counts, workers
+    )
+    return phi_short - phi_long
+
+
 def approximate_phi(
     x: FPtr, n: Int, order: Int, tolerance: Float64, metric: Int
 ) -> Float64:
@@ -205,17 +329,30 @@ def approximate_phi(
 
 
 def approximate_entropy(
-    x: FPtr, n: Int, order: Int, tolerance: Float64, metric: Int
+    x: FPtr,
+    n: Int,
+    order: Int,
+    tolerance: Float64,
+    metric: Int,
+    workers: Int,
+    counts: IPtr,
 ) -> Float64:
-    return (
-        approximate_phi(x, n, order, tolerance, metric)
-        - approximate_phi(x, n, order + 1, tolerance, metric)
+    if n < APP_ENTROPY_PARALLEL_MIN or workers <= 1:
+        return approximate_phi(x, n, order, tolerance, metric) - approximate_phi(
+            x, n, order + 1, tolerance, metric
+        )
+    return approximate_entropy_parallel(
+        x, n, order, tolerance, metric, counts, workers
     )
 
 
 def sample_entropy(
     x: FPtr, n: Int, order: Int, tolerance: Float64, metric: Int
 ) -> Float64:
+    # Serial on purpose. A parallel split of the outer template index was
+    # measured here and reverted: at n = 1500 it tied serial (6.1 ms both
+    # ways) and it lost to serial below that, so it would only have slowed the
+    # sizes real callers pass. See README "Parallelism" for the numbers.
     var vectors = n - order
     if order == 2:
         var inclusive = not (metric == 0 and n < 5000)
@@ -589,7 +726,98 @@ def dfa_fluctuation(walk: FPtr, n: Int, scale: Int) -> Float64:
     return sqrt(total_fluctuation / Float64(windows))
 
 
-def detrended_fluctuation(x: FPtr, walk: FPtr, n: Int) -> Float64:
+# DFA parallel path: one level of fan-out for the whole run, not one per scale.
+#
+# The first attempt parallelised the window loop of each scale separately. On
+# this host that was 220 ms against 15 ms serial at n = 100k: ~40 tiny
+# parallelize calls in a row cost more than the work they split. Instead the
+# work is flattened into (scale, start) items, each worker walks its items in
+# order and accumulates one running residual sum per scale in slot
+# `worker * num_scales + scale`, and the totals are added scale by scale in
+# worker order. Each window computes exactly the expression the serial loop
+# computes and the per-scale additions happen in the same order, so the result
+# is bit-identical to the serial path.
+def dfa_scales(n: Int) -> List[Int]:
+    var result = List[Int]()
+    var max_scale = 0.1 * Float64(n)
+    if max_scale <= 4.0:
+        return result^
+    var max_i = Int(floor(log(max_scale / 4.0) / log(1.2)))
+    var last_scale = Int64(4)
+    var current = Float64(4)
+    for i in range(max_i + 1):
+        if i > 0:
+            current *= 1.2
+        var scale = Int(floor(current))
+        if Int64(scale) <= last_scale and i > 0:
+            continue
+        last_scale = Int64(scale)
+        result.append(scale)
+    return result^
+
+
+def dfa_fluctuations_parallel(
+    walk: FPtr, n: Int, scales: List[Int], workers: Int
+) -> Float64:
+    var num_scales = len(scales)
+    var work_items = workers * num_scales
+    var partials = empty_partials(work_items)
+    for i in range(work_items):
+        partials.unsafe_store(i, 0.0)
+    def work(item: Int) {imm}:
+        var worker = item // num_scales
+        var scale = scales.unsafe_get(item % num_scales)
+        var windows = n // scale
+        var sx = Float64(scale * (scale - 1)) * 0.5
+        var sx2 = Float64(scale * (scale - 1) * (2 * scale - 1)) / 6.0
+        var total = Float64(0)
+        var window = worker
+        while window < windows:
+            var base = window * scale
+            var sy = Float64(0)
+            var sxy = Float64(0)
+            for j in range(scale):
+                sy += walk[base + j]
+                sxy += Float64(j) * walk[base + j]
+            var slope = linear_slope_from_sums(scale, sx, sx2, sy, sxy)
+            var intercept = sy / Float64(scale) - slope * sx / Float64(scale)
+            var residual = Float64(0)
+            for j in range(scale):
+                var delta = walk[base + j] - (intercept + slope * Float64(j))
+                residual += delta * delta
+            total += residual / Float64(scale)
+            window += workers
+        partials.unsafe_store(item, total)
+    parallelize(work, work_items, workers)
+
+    var count = Int(0)
+    var sx = Float64(0)
+    var sx2 = Float64(0)
+    var sy = Float64(0)
+    var sxy = Float64(0)
+    for scale_index in range(num_scales):
+        var scale = scales.unsafe_get(scale_index)
+        var windows = n // scale
+        var total_fluctuation = Float64(0)
+        for worker in range(workers):
+            total_fluctuation += partials.unsafe_load(worker * num_scales + scale_index)
+        var fluctuation = sqrt(total_fluctuation / Float64(windows))
+        if fluctuation > 0.0:
+            var lx = log(Float64(scale))
+            var ly = log(fluctuation)
+            sx += lx
+            sx2 += lx * lx
+            sy += ly
+            sxy += lx * ly
+            count += 1
+    if count == 0:
+        return nan_value()
+    return linear_slope_from_sums(count, sx, sx2, sy, sxy)
+
+
+def detrended_fluctuation(
+    x: FPtr, walk: FPtr, n: Int, workers: Int
+) -> Float64:
     var mean = Float64(0)
     for i in range(n):
         mean += x[i]
@@ -602,21 +830,19 @@ def detrended_fluctuation(x: FPtr, walk: FPtr, n: Int) -> Float64:
     var max_scale = 0.1 * Float64(n)
     if max_scale <= 4.0:
         return nan_value()
-    var max_i = Int(floor(log(max_scale / 4.0) / log(1.2)))
-    var last_scale = Int64(4)
+    var scales = dfa_scales(n)
+    if len(scales) == 0:
+        return nan_value()
+    if workers > 1 and n >= DFA_PARALLEL_MIN:
+        return dfa_fluctuations_parallel(walk, n, scales, workers)
+
     var count = Int(0)
     var sx = Float64(0)
     var sx2 = Float64(0)
     var sy = Float64(0)
     var sxy = Float64(0)
-    var current = Float64(4)
-    for i in range(max_i + 1):
-        if i > 0:
-            current *= 1.2
-        var scale = Int(floor(current))
-        if Int64(scale) <= last_scale and i > 0:
-            continue
-        last_scale = Int64(scale)
+    for scale_index in range(len(scales)):
+        var scale = scales.unsafe_get(scale_index)
         var fluctuation = dfa_fluctuation(walk, n, scale)
         if fluctuation > 0.0:
             var lx = log(Float64(scale))
@@ -656,17 +882,23 @@ def ma_perm_entropy(
     var keys = ip(keys_addr)
     var counts = ip(counts_addr)
     var work = ip(work_addr)
+    # Serial: real callers pass one long signal rather than a batch of rows,
+    # and a multi-row batch was not measured to win with workers, so no
+    # parallel path is claimed here. Each call still clears its own table.
     for row in range(rows):
-        result[row] = permutation_entropy_row(
-            x + row * n,
-            n,
-            order,
-            delay,
-            normalize != 0,
-            keys,
-            counts,
-            work,
-            capacity,
+        result.unsafe_store(
+            row,
+            permutation_entropy_row(
+                x + row * n,
+                n,
+                order,
+                delay,
+                normalize != 0,
+                keys,
+                counts,
+                work,
+                capacity,
+            ),
         )
 
 
@@ -683,22 +915,40 @@ def ma_perm_entropy_order3(
         return
     var x = fp(x_addr)
     var result = fp(result_addr)
+    # Serial: same reasoning as ma_perm_entropy -- see the note there.
     for row in range(rows):
-        result[row] = permutation_entropy_order3_row(
-            x + row * n,
-            n,
-            delay,
-            normalize != 0,
+        result.unsafe_store(
+            row,
+            permutation_entropy_order3_row(
+                x + row * n,
+                n,
+                delay,
+                normalize != 0,
+            ),
         )
 
 
 @export("ma_app_entropy")
 def ma_app_entropy(
-    x_addr: Int, n: Int, order: Int, tolerance: Float64, metric: Int
+    x_addr: Int,
+    counts_addr: Int,
+    n: Int,
+    order: Int,
+    tolerance: Float64,
+    metric: Int,
+    workers_addr: Int,
 ) abi("C") -> Float64:
-    if x_addr == 0 or n <= order or order < 1:
+    if x_addr == 0 or counts_addr == 0 or n <= order or order < 1:
         return nan_value()
-    return approximate_entropy(fp(x_addr), n, order, tolerance, metric)
+    return approximate_entropy(
+        fp(x_addr),
+        n,
+        order,
+        tolerance,
+        metric,
+        workers_param(workers_addr),
+        ip(counts_addr),
+    )
 
 
 @export("ma_sample_entropy")
@@ -735,8 +985,30 @@ def ma_sample_entropy_order2_counts(
         i_stride,
     )
     var result = ip(counts_addr)
-    result[0] = counts[0]
-    result[1] = counts[1]
+    result.unsafe_store(0, counts[0])
+    result.unsafe_store(1, counts[1])
+
+
+@export("ma_parallel_capacity")
+def ma_parallel_capacity(size: Int) abi("C") -> Int:
+    """Int64 slots the caller must provide for a parallel scratch buffer."""
+    return max(size, 1) if size < 2_000_000_000 else 2_000_000_000
+
+
+@export("ma_parallel_cap")
+def ma_parallel_cap() abi("C") -> Int:
+    """Worker ceiling for every parallel path (this host is shared)."""
+    return WORKER_CAP
+
+
+@export("ma_parallel_workers")
+def ma_parallel_workers(slot_addr: Int) abi("C"):
+    """Validate the caller's worker knob.
+
+    There is no library-side state to set: the knob is the caller's own UInt64,
+    whose address is passed to each kernel as ``workers_addr``.
+    """
+    _ = slot_addr
 
 
 @export("ma_lziv_complexity")
@@ -771,8 +1043,10 @@ def ma_num_zerocross(
         return
     var x = fp(x_addr)
     var result = ip(result_addr)
+    # Serial: this kernel is memory-bound and four workers measured slower than
+    # one at 512-1000 rows on the benchmark host (see README).
     for row in range(rows):
-        result[row] = zero_crossings_row(x + row * n, n)
+        result.unsafe_store(row, zero_crossings_row(x + row * n, n))
 
 
 @export("ma_hjorth_params")
@@ -783,6 +1057,7 @@ def ma_hjorth_params(
     rows: Int,
     n: Int,
     sf: Float64,
+    workers_addr: Int,
 ) abi("C"):
     if (
         x_addr == 0 or mobility_addr == 0 or complexity_addr == 0
@@ -792,8 +1067,19 @@ def ma_hjorth_params(
     var x = fp(x_addr)
     var mobility = fp(mobility_addr)
     var complexity = fp(complexity_addr)
-    for row in range(rows):
-        hjorth_row(x + row * n, n, sf, mobility, complexity, row)
+    var workers = workers_param(workers_addr)
+    if rows < HJORTH_ROWS_PARALLEL_MIN:
+        workers = 1
+    var ranges = split_ranges(rows, workers)
+    def run_range(index: Int) {imm}:
+        var start = ranges[index].unsafe_get(0)
+        var stop = ranges[index].unsafe_get(1)
+        for row in range(start, stop):
+            hjorth_row(x + row * n, n, sf, mobility, complexity, row)
+    if workers > 1:
+        parallelize(run_range, workers, workers)
+    else:
+        run_range(0)
 
 
 @export("ma_petrosian_fd")
@@ -804,8 +1090,10 @@ def ma_petrosian_fd(
         return
     var x = fp(x_addr)
     var result = fp(result_addr)
+    # Serial: this kernel is memory-bound and four workers measured slower than
+    # one at 512-1000 rows on the benchmark host (see README).
     for row in range(rows):
-        result[row] = petrosian_row(x + row * n, n)
+        result.unsafe_store(row, petrosian_row(x + row * n, n))
 
 
 @export("ma_katz_fd")
@@ -816,8 +1104,10 @@ def ma_katz_fd(
         return
     var x = fp(x_addr)
     var result = fp(result_addr)
+    # Serial: this kernel is memory-bound and four workers measured slower than
+    # one at 512-1000 rows on the benchmark host (see README).
     for row in range(rows):
-        result[row] = katz_row(x + row * n, n)
+        result.unsafe_store(row, katz_row(x + row * n, n))
 
 
 @export("ma_higuchi_fd")
@@ -829,8 +1119,10 @@ def ma_higuchi_fd(x_addr: Int, n: Int, kmax: Int) abi("C") -> Float64:
 
 @export("ma_detrended_fluctuation")
 def ma_detrended_fluctuation(
-    x_addr: Int, walk_addr: Int, n: Int
+    x_addr: Int, walk_addr: Int, n: Int, workers_addr: Int
 ) abi("C") -> Float64:
     if x_addr == 0 or walk_addr == 0 or n <= 0:
         return nan_value()
-    return detrended_fluctuation(fp(x_addr), fp(walk_addr), n)
+    return detrended_fluctuation(
+        fp(x_addr), fp(walk_addr), n, workers_param(workers_addr)
+    )
