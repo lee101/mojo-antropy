@@ -270,8 +270,8 @@ def sample_entropy_order2_range(
         var xi2 = SIMD[DType.float64, W](x[i + 2])
         var j = i + 1
         while j + W <= vectors:
-            var d0 = abs(x.load[width=W](j) - xi0)
-            var d1 = abs(x.load[width=W](j + 1) - xi1)
+            var d0 = abs(x.unsafe_load[width=W](j) - xi0)
+            var d1 = abs(x.unsafe_load[width=W](j + 1) - xi1)
             var base = (
                 max(d0, d1).le(tolerance)
                 if inclusive
@@ -283,7 +283,7 @@ def sample_entropy_order2_range(
                     if inclusive
                     else (d0 * d0 + d1 * d1).lt(radius2)
                 )
-            var d2 = abs(x.load[width=W](j + 2) - xi2)
+            var d2 = abs(x.unsafe_load[width=W](j + 2) - xi2)
             var extended = base & (
                 max(max(d0, d1), d2).le(tolerance)
                 if inclusive
@@ -365,10 +365,10 @@ def packed_word(sequence: BPtr, bit: Int) -> UInt64:
     var byte = bit // 8
     var shift = bit % 8
     var words = (sequence + byte).bitcast[UInt64]()
-    var low = words.load[alignment=1]()
+    var low = words.unsafe_load[alignment=1]()
     if shift == 0:
         return low
-    var high = (sequence + byte + 8).bitcast[UInt64]().load[alignment=1]()
+    var high = (sequence + byte + 8).bitcast[UInt64]().unsafe_load[alignment=1]()
     return (low >> UInt64(shift)) | (high << UInt64(64 - shift))
 
 
@@ -518,7 +518,7 @@ def higuchi(x: FPtr, n: Int, kmax: Int) -> Float64:
         var i = k
         while i + W <= n:
             var delta = abs(
-                x.load[width=W](i) - x.load[width=W](i - k)
+                x.unsafe_load[width=W](i) - x.unsafe_load[width=W](i - k)
             )
             total_curve += delta.reduce_add()
             i += W
