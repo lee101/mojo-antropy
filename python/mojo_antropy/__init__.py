@@ -1,4 +1,4 @@
-from ._lib import parallel_workers
+from ._lib import gpu, gpu_available, parallel_workers
 from .core import (
     app_entropy,
     detrended_fluctuation,
@@ -25,4 +25,6 @@ __all__ = [
     "higuchi_fd",
     "detrended_fluctuation",
     "parallel_workers",
+    "gpu",
+    "gpu_available",
 ]

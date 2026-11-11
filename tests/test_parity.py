@@ -298,7 +298,10 @@ def test_exported_abi_rejects_null_buffers():
     native = lib()
     native.ma_perm_entropy(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     native.ma_perm_entropy_order3(0, 0, 0, 0, 0, 0)
-    assert np.isnan(native.ma_app_entropy(0, 0, 0, 0, 0.0, 0, 0))
+    assert np.isnan(native.ma_app_entropy(0, 0, 0, 0, 0.0, 0, 0, 0))
+    # With the GPU opt-in set but a null signal, the null check must still win
+    # and no device work must be attempted.
+    assert np.isnan(native.ma_app_entropy(0, 0, 0, 0, 0.0, 0, 0, 1))
     assert np.isnan(native.ma_sample_entropy(0, 0, 0, 0.0, 0))
     native.ma_sample_entropy_order2_counts(0, 0, 0, 0.0, 0, 0, 0)
     assert native.ma_lziv_complexity(0, 0) == 1

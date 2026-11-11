@@ -66,8 +66,8 @@ The test suite compares every covered function against the real `antropy`
 explicit-tolerance inputs. It also exercises both upstream sample-entropy
 branches around the 5,000-sample Numba/KD-tree cutoff, the sample-entropy
 parallel cutoff and SIMD remainder, the packed-binary LZ path, and the Higuchi
-SIMD remainder path. Run the 79 parity, validation, and behavior tests with
-`pixi run test`.
+SIMD remainder path. Run the 118 parity, validation, and behavior tests with
+`pixi run test`; the 14 GPU parity tests skip when no device is usable.
 
 ## Benchmarks
 
@@ -96,10 +96,85 @@ precomputed rolling 64-bit windows, while other alphabets use the general
 serial parser. The order-3 permutation and Higuchi paths retain their existing
 fixed-counter and SIMD implementations.
 
-No GPU path is provided. Sample matching performs fewer than roughly two
-arithmetic operations per byte loaded, and LZ parsing is branch-heavy and
-data-dependent, so neither target has enough arithmetic intensity to repay
-device transfer and launch costs.
+## GPU
+
+The GPU path covers `app_entropy` only. It is the one measure in the
+[analysis](bench/analysis.md) that clears the 2 flops/byte gate: the match loop
+is O(n²) over an n-sample signal, so at n = 10k it performs roughly 5×10⁸
+comparisons over an 80 KB signal. Every other entry point streams its input once
+or a few times per sample (0.12–1.2 flops/byte in the analysis table) and stays
+on the CPU.
+
+The path is opt-in and the CPU path remains the default and the fallback:
+
+```python
+import numpy as np
+import mojo_antropy as ant
+
+ant.gpu(True)          # opt in; calls below the threshold still use the CPU
+print(ant.app_entropy(np.random.default_rng(0).normal(size=20_000)))
+ant.gpu(False)         # back to CPU-only
+```
+
+One block is launched per template row, with the block's lanes splitting that
+row's columns and keeping partial match counts. The signal is copied to the
+device once, the kernel is launched once per `φ` phase, and the partial counts
+are copied back once. The per-row reduction and the log sum then run on the
+host in the same order as the CPU path, so the two agree exactly rather than to
+a tolerance. Grids are sized to `vectors` blocks, and lanes walk
+`j = lane; j < vectors; j += lanes`, so the column tail is covered explicitly;
+the tests use sizes such as 6001 and 6143 that are not multiples of the 256
+lanes. Device allocations are bounded below 1.5 GB by halving the lane count
+for very large inputs.
+
+### Measured before and after
+
+`pixi run` on the host in this repository: Intel Xeon E5-2697 v4 (72 threads)
+and a shared NVIDIA RTX 5090 that was running other production workloads
+throughout (57–100% utilisation, ~26 GB already resident). Best of five warmed
+runs, identical contiguous inputs, `float64`. "Before" is the CPU path shipped
+in the previous phase; "after" is the GPU path.
+
+| n (samples) | CPU, 1 worker | CPU, 4 workers | GPU | GPU vs CPU 4 workers |
+| ---: | ---: | ---: | ---: | ---: |
+| 5,000 | 172.58 ms | 65.76 ms | 67.76 ms | 0.97x (loses) |
+| 6,000 | 248.61 ms | 87.10 ms | **6.85 ms** | **12.71x faster** |
+| 8,000 | 463.69 ms | 157.59 ms | **11.23 ms** | **14.04x faster** |
+| 16,000 | 1872.79 ms | 499.78 ms | **38.07 ms** | **13.13x faster** |
+| 32,000 | 7462.16 ms | 1849.52 ms | **73.43 ms** | **25.19x faster** |
+| 64,000 | 30052.66 ms | 7089.43 ms | **209.12 ms** | **33.90x faster** |
+
+The crossover is between 5,000 and 6,000 samples, which is why the native
+threshold is 6,000. Below it the transfer and launch cost is not repaid and the
+GPU is marginally slower, so those calls stay on the CPU and the README does
+not claim a win there. Real callers of an O(n²) estimator do pass this size:
+the analysis flags `app_entropy` at 5k samples as its top regression (4.8x
+slower than upstream), and the 8k–64k range is where the GPU is now 13x–34x
+faster than the four-worker CPU path.
+
+The GPU was under heavy contention from other workloads for every measurement
+above, so these are conservative: an idle device would show a different, almost
+certainly better, ratio. They were not adjusted to look better.
+
+### Tests and skipped cases
+
+`tests/test_gpu.py` runs every covered size through the CPU serial, CPU
+parallel, and GPU paths and requires exact equality, plus the Euclidean metric,
+orders 1–3, the below-threshold CPU-only case, and the opt-in switch. On a host
+with no usable device the GPU tests skip with a reason naming that cause, and
+`pixi run test` still passes. That skip path was exercised on this machine with
+the device hidden from CUDA: 14 tests **skipped**, 2 passed. There is no
+CPU-only machine available here, so the tests have not been run on real
+GPU-less hardware.
+
+The device query (`ant.gpu_available()`) constructs a real device context, so it
+is intended for a known-good host. On the pinned toolchain
+(`mojo ==1.2.0.dev2026092605`), a driver that is present but hides every device
+(for example `CUDA_VISIBLE_DEVICES=""`) aborts the process rather than raising.
+`app_entropy` is not exposed to that, because it only enters the GPU path when
+`gpu(True)` has been set explicitly; with the switch off it never touches the
+device. The in-kernel `except` fallback covers ordinary device errors, but it
+cannot catch that process abort.
 
 ## How it works
 

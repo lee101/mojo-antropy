@@ -5,7 +5,7 @@ from math import factorial, log
 
 import numpy as np
 
-from ._lib import addr, f64, lib, parallel_capacity, workers
+from ._lib import addr, f64, gpu_flag, lib, parallel_capacity, workers
 
 
 def _integral(value, name: str) -> int:
@@ -135,6 +135,7 @@ def app_entropy(x, order=2, tolerance=None, metric="chebyshev"):
         radius,
         _metric_code(metric),
         workers(),
+        gpu_flag(),
     )
 
 

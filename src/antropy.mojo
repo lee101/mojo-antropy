@@ -4,6 +4,8 @@ from std.bit import count_trailing_zeros
 from std.sys import simd_width_of as simdwidthof
 from std.collections import List
 from max.algorithm import parallelize
+from max.gpu import block_idx, thread_idx
+from max.gpu.host import DeviceContext
 
 
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
@@ -343,6 +345,142 @@ def approximate_entropy(
         )
     return approximate_entropy_parallel(
         x, n, order, tolerance, metric, counts, workers
+    )
+
+
+# --- GPU path for approximate entropy -------------------------------------
+#
+# Approximate entropy is the only measure here that clears the arithmetic-
+# intensity gate in bench/analysis.md. Its match loop is O(n^2) over an
+# n-sample signal: at n = 10k that is ~5e8 comparisons over an 80 KB signal,
+# thousands of flops per byte, against the 2 flops/byte gate. Every other
+# entry point streams its input once or a few times per sample and stays on
+# the CPU; bench/analysis.md records them as memory-bound.
+#
+# Shape of the launch. The CPU path evaluates two Phi values, each a full n^2
+# pass. The GPU does the same in two launches: one block per template row,
+# with the block_dim lanes of that block splitting the columns and each lane
+# keeping its own partial match count. The signal is copied to the device
+# once per call and the partials are copied back once; the reduction and the
+# log sum then run on the host in the same order the CPU uses, so the two
+# paths agree exactly rather than merely to rounding.
+#
+# Tail handling. The grid is exactly `vectors` blocks, so there is no ragged
+# grid edge to pad; a block index at or past `vectors` returns immediately
+# for the defensive case where a caller launches a wider grid. The column
+# loop is `j = lane; j < vectors; j += Lanes`, so lane counts differ by at
+# most one and no lane reads past `vectors - 1`, whatever the remainder when
+# `vectors` is divided by the lane count. Both properties are covered by the
+# GPU parity test at sizes that are not multiples of the block size.
+comptime GPU_APP_ENTROPY_MIN = 6000
+comptime GPU_LANES = 256
+
+
+def app_entropy_phi_kernel(
+    x: FPtr,
+    partials: IPtr,
+    vectors_value: Int64,
+    order_value: Int64,
+    tolerance: Float64,
+    metric: Int64,
+    lanes_value: Int64,
+):
+    var vectors = Int(vectors_value)
+    var order = Int(order_value)
+    var lanes = Int(lanes_value)
+    var row = Int(block_idx.x)
+    if row >= vectors:
+        return
+    var lane = Int(thread_idx.x)
+    var matches = Int64(0)
+    var radius2 = tolerance * tolerance
+    var j = lane
+    while j < vectors:
+        if metric == 0:
+            var distance = Float64(0)
+            for k in range(order):
+                var delta = x[row + k] - x[j + k]
+                if delta < 0.0:
+                    delta = -delta
+                if delta > distance:
+                    distance = delta
+            if distance <= tolerance:
+                matches += 1
+        else:
+            var squared = Float64(0)
+            for k in range(order):
+                var delta = x[row + k] - x[j + k]
+                squared += delta * delta
+            if squared <= radius2:
+                matches += 1
+        j += lanes
+    partials[row * lanes + lane] = matches
+
+
+def gpu_available() -> Bool:
+    # Constructing a context is how this toolchain reports whether a device
+    # exists; it raises on a CPU-only host.
+    try:
+        var ctx = DeviceContext()
+        _ = ctx.name()
+        return True
+    except:
+        return False
+
+
+def app_entropy_gpu_phi(
+    x: FPtr, n: Int, order: Int, tolerance: Float64, metric: Int
+) raises -> Float64:
+    var vectors = n - order + 1
+    var lanes = GPU_LANES
+    # 8 bytes per lane partial plus the 8-byte-per-sample signal. At the
+    # largest n this path is called with in practice (a few 100k) that is
+    # ~2 GB of partials, so the ceiling below keeps every allocation well
+    # inside the 2 GB device budget by halving the lane count instead. The
+    # host reduction below uses the value chosen here, so the grid and the
+    # reduction can never disagree about the lane count.
+    while Int64(vectors) * Int64(lanes) * 8 > 1_500_000_000:
+        lanes //= 2
+        if lanes < 1:
+            lanes = 1
+            break
+    var ctx = DeviceContext()
+    var device_x = ctx.enqueue_create_buffer[DType.float64](n)
+    var device_partials = ctx.enqueue_create_buffer[DType.int64](vectors * lanes)
+    var host_partials = ctx.enqueue_create_host_buffer[DType.int64](vectors * lanes)
+    ctx.enqueue_copy(device_x, x)
+    ctx.enqueue_function[app_entropy_phi_kernel](
+        device_x,
+        device_partials,
+        Int64(vectors),
+        Int64(order),
+        tolerance,
+        Int64(metric),
+        Int64(lanes),
+        grid_dim=vectors,
+        block_dim=lanes,
+    )
+    ctx.enqueue_copy(host_partials, device_partials)
+    ctx.synchronize()
+    var total = Float64(0)
+    for i in range(vectors):
+        var matches = Int64(0)
+        var base = i * lanes
+        for lane in range(lanes):
+            matches += host_partials[base + lane]
+        total += log(Float64(matches) / Float64(vectors))
+    return total / Float64(vectors)
+
+
+def app_entropy_gpu(
+    x: FPtr, n: Int, order: Int, tolerance: Float64, metric: Int
+) raises -> Float64:
+    # The signal is uploaded twice, once per Phi. Fusing the two orders into
+    # one launch would need a per-row block that matches both order and
+    # order+1 in a single pass, which changes the summation order; keeping two
+    # launches preserves the CPU path's arithmetic exactly.
+    return app_entropy_gpu_phi(x, n, order, tolerance, metric) - app_entropy_gpu_phi(
+        x, n, order + 1, tolerance, metric
     )
 
 
@@ -937,9 +1075,19 @@ def ma_app_entropy(
     tolerance: Float64,
     metric: Int,
     workers_addr: Int,
+    use_gpu: Int = 0,
 ) abi("C") -> Float64:
     if x_addr == 0 or counts_addr == 0 or n <= order or order < 1:
         return nan_value()
+    # The CPU path stays the default and the fallback. A device is only tried
+    # when the caller opts in and the signal is large enough for the host
+    # round-trip to be repaid; any device error falls back rather than
+    # propagating, so a host without a usable GPU behaves exactly as before.
+    if use_gpu != 0 and n >= GPU_APP_ENTROPY_MIN:
+        try:
+            return app_entropy_gpu(fp(x_addr), n, order, tolerance, metric)
+        except:
+            pass
     return approximate_entropy(
         fp(x_addr),
         n,
@@ -949,6 +1097,18 @@ def ma_app_entropy(
         workers_param(workers_addr),
         ip(counts_addr),
     )
+
+
+@export("ma_gpu_available")
+def ma_gpu_available() abi("C") -> Int:
+    """1 when a device context can be created, 0 on a CPU-only host."""
+    return 1 if gpu_available() else 0
+
+
+@export("ma_gpu_app_entropy_min")
+def ma_gpu_app_entropy_min() abi("C") -> Int:
+    """Smallest signal size the GPU approximate-entropy path accepts."""
+    return GPU_APP_ENTROPY_MIN
 
 
 @export("ma_sample_entropy")

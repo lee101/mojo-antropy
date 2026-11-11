@@ -18,7 +18,9 @@ _SIGNATURES = {
     "ma_parallel_workers": ([I], None),
     "ma_perm_entropy": ([I] * 11, None),
     "ma_perm_entropy_order3": ([I] * 6, None),
-    "ma_app_entropy": ([I, I, I, I, F, I, I], F),
+    "ma_app_entropy": ([I, I, I, I, F, I, I, I], F),
+    "ma_gpu_available": ([], I),
+    "ma_gpu_app_entropy_min": ([], I),
     "ma_sample_entropy": ([I, I, I, F, I], F),
     "ma_sample_entropy_order2_counts": ([I, I, I, F, I, I, I], None),
     "ma_lziv_complexity": ([I, I], I),
@@ -93,6 +95,51 @@ def parallel_capacity(size: int) -> int:
 def workers() -> int:
     """Address of the live worker knob, passed to parallel-capable kernels."""
     return addr(_WORKER_SLOT)
+
+
+# Opt-in GPU switch. Default 0 keeps every call on the CPU path, so importing
+# this package never touches a device. Callers turn it on explicitly with
+# ``gpu(enabled=True)``; the library still falls back to the CPU on any device
+# error, and ``gpu_available()`` reports whether a device is really there.
+_GPU_ENABLED = False
+
+
+def gpu(enabled: bool | None = None) -> bool:
+    """Enable or disable the GPU path, or query it when called with no argument.
+
+    The GPU covers ``app_entropy`` only: at n >= 6000 its O(n^2) match loop is
+    dense enough to repay the host round-trip. Signals below that stay on the
+    CPU, where the transfer would dominate.
+    """
+    global _GPU_ENABLED
+    if enabled is not None:
+        _GPU_ENABLED = bool(enabled)
+    return _GPU_ENABLED
+
+
+def gpu_available() -> bool:
+    """True when a device context can be created on this host.
+
+    This constructs a real device context, so it is only safe to call on a
+    machine with a working GPU driver. On a host whose driver is present but
+    broken or hidden (for example ``CUDA_VISIBLE_DEVICES=""``) the native
+    probe can abort the process instead of raising, which is a limitation of
+    the pinned toolchain's device layer rather than of this package. Feature
+    code should therefore not call this; it should call ``gpu(True)`` and let
+    ``app_entropy`` fall back. ``gpu_available`` is for tests and for callers
+    deciding whether to enable the GPU on a known-good host.
+    """
+    return bool(lib().ma_gpu_available())
+
+
+def gpu_app_entropy_min() -> int:
+    """Smallest signal size the GPU approximate-entropy path accepts."""
+    return int(lib().ma_gpu_app_entropy_min())
+
+
+def gpu_flag() -> int:
+    """1 when the GPU path is enabled, for kernels that take an opt-in flag."""
+    return 1 if _GPU_ENABLED else 0
 
 
 def addr(array: np.ndarray) -> int:
